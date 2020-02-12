@@ -3,6 +3,7 @@ File-based Checkpoints implementations.
 """
 import os
 import shutil
+import time
 
 from tornado.web import HTTPError
 
@@ -14,7 +15,7 @@ from .fileio import FileManagerMixin
 
 from jupyter_core.utils import ensure_dir_exists
 from ipython_genutils.py3compat import getcwd
-from traitlets import Unicode
+from traitlets import Unicode, Int
 
 from notebook import _tz as tz
 
@@ -39,6 +40,18 @@ class FileCheckpoints(FileManagerMixin, Checkpoints):
         """,
     )
 
+    max_checkpoints = Int(
+        5,
+        config=True, 
+        help="""Maximum number of checkpoints to save"""
+    )
+
+    min_seconds_between_checkpoints = Int(
+        60, 
+        config=True, 
+        help="""If two checkpoints differ less than this, the existing one is overwritten"""
+    )
+
     root_dir = Unicode(config=True)
 
     def _root_dir_default(self):
@@ -47,10 +60,49 @@ class FileCheckpoints(FileManagerMixin, Checkpoints):
         except AttributeError:
             return getcwd()
 
+    def get_checkpoint_ids(self):
+        base_id = u'checkpoint'
+        ids = []
+        for i in range(self.max_checkpoints):
+            ids.append('{}{}'.format(base_id, i))
+        return ids
+
+    def get_free_checkpoint_ids(self, path):
+        path = path.strip('/')
+        checkpoint_ids = self.get_checkpoint_ids()
+        free_ids = []
+        for checkpoint_id in checkpoint_ids:
+            os_path = self.checkpoint_path(checkpoint_id, path)
+            if not os.path.isfile(os_path):
+                free_ids.append(checkpoint_id)
+        return free_ids
+
+    def timedelta(self, timestamp1, timestamp2):
+        if timestamp1 > timestamp2:
+            delta = timestamp1 - timestamp2
+        else:
+            delta = timestamp2 - timestamp1
+        return delta.days*24*60*60 + delta.seconds
+
     # ContentsManager-dependent checkpoint API
     def create_checkpoint(self, contents_mgr, path):
         """Create a checkpoint."""
         checkpoint_id = u'checkpoint'
+        # Check if there are free checkpoint ids
+        free_ids = self.get_free_checkpoint_ids(path)
+        if len(free_ids) > 0:
+            checkpoint_id = free_ids[0]
+        else:
+            # Get the current checkpoints
+            used_checkpoints = self.list_checkpoints(path)
+            cur_time = tz.utcfromtimestamp(time.time())
+            # If difference between last checkpoint and the current one is less than a delta
+            # replace the last one, else replace the oldest one
+            if self.timedelta(used_checkpoints[0]['last_modified'], cur_time) < self.min_seconds_between_checkpoints:
+                checkpoint_id = used_checkpoints[0]['id']
+            else:
+                checkpoint_id = used_checkpoints[-1]['id']            
+        
         src_path = contents_mgr._get_os_path(path)
         dest_path = self.checkpoint_path(checkpoint_id, path)
         self._copy(src_path, dest_path)
@@ -88,17 +140,15 @@ class FileCheckpoints(FileManagerMixin, Checkpoints):
             os.unlink(cp_path)
 
     def list_checkpoints(self, path):
-        """list the checkpoints for a given file
-
-        This contents manager currently only supports one checkpoint per file.
-        """
+        """list the checkpoints for a given file"""
         path = path.strip('/')
-        checkpoint_id = "checkpoint"
-        os_path = self.checkpoint_path(checkpoint_id, path)
-        if not os.path.isfile(os_path):
-            return []
-        else:
-            return [self.checkpoint_model(checkpoint_id, os_path)]
+        checkpoint_ids = self.get_checkpoint_ids()
+        checkpoints = []
+        for checkpoint_id in checkpoint_ids:
+            os_path = self.checkpoint_path(checkpoint_id, path)
+            if os.path.isfile(os_path):
+                checkpoints.append(self.checkpoint_model(checkpoint_id, os_path))
+        return sorted(checkpoints, key=lambda x: x['last_modified'], reverse=True)
 
     # Checkpoint-related utilities
     def checkpoint_path(self, checkpoint_id, path):
